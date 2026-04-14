@@ -101,7 +101,7 @@ def extract_flanking_segments_excluding_aloop(
 
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("struct", input_pdb)
-    model, chain = _first_model_first_chain(structure, input_pdb)
+    _, chain = _first_model_first_chain(structure, input_pdb)
 
     ppb = PPBuilder()
     peptides = list(ppb.build_peptides(chain))
@@ -279,6 +279,182 @@ def kabsch_rigid_transform(P: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np
     return R, t
 
 
+@dataclass(frozen=True)
+class AtomRecord:
+    record: str
+    atom_name: str
+    altloc: str
+    resname: str
+    chain_id: str
+    resseq: str
+    icode: str
+    coord: np.ndarray
+
+
+def _format_pdb_coord(value: float) -> str:
+    return f"{value:8.3f}"
+
+
+def _iter_atom_records(pdb_path: str) -> list[AtomRecord]:
+    records: list[AtomRecord] = []
+    with open(pdb_path, "r") as f:
+        for line in f:
+            record = line[:6].strip()
+            if record not in {"ATOM", "HETATM"}:
+                continue
+            coord = np.asarray(
+                [
+                    float(line[30:38]),
+                    float(line[38:46]),
+                    float(line[46:54]),
+                ],
+                dtype=float,
+            )
+            records.append(
+                AtomRecord(
+                    record=record,
+                    atom_name=line[12:16],
+                    altloc=line[16],
+                    resname=line[17:20],
+                    chain_id=line[21],
+                    resseq=line[22:26],
+                    icode=line[26],
+                    coord=coord,
+                )
+            )
+    return records
+
+
+def _atom_record_key(atom: AtomRecord) -> tuple[str, str, str, str, str, str, str]:
+    return (
+        atom.record,
+        atom.atom_name,
+        atom.altloc,
+        atom.resname,
+        atom.chain_id,
+        atom.resseq,
+        atom.icode,
+    )
+
+
+def _consecutive_ca_distances(pdb_path: str) -> list[float]:
+    ca_records = [
+        atom
+        for atom in _iter_atom_records(pdb_path)
+        if atom.record == "ATOM" and atom.atom_name.strip() == "CA" and atom.altloc.strip() in {"", "A"}
+    ]
+    distances: list[float] = []
+    for a, b in zip(ca_records, ca_records[1:]):
+        distances.append(float(np.linalg.norm(a.coord - b.coord)))
+    return distances
+
+
+def max_consecutive_ca_distance(pdb_path: str) -> float:
+    distances = _consecutive_ca_distances(pdb_path)
+    return max(distances, default=0.0)
+
+
+def _collect_residue_coord_spreads(pdb_path: str) -> dict[tuple[str, str, str, str], float]:
+    grouped: dict[tuple[str, str, str, str], list[np.ndarray]] = {}
+    for atom in _iter_atom_records(pdb_path):
+        residue_key = (atom.chain_id, atom.resseq, atom.icode, atom.resname)
+        grouped.setdefault(residue_key, []).append(atom.coord)
+    spreads: dict[tuple[str, str, str, str], float] = {}
+    for residue_key, coords in grouped.items():
+        max_dist = 0.0
+        for i in range(len(coords)):
+            for j in range(i + 1, len(coords)):
+                max_dist = max(max_dist, float(np.linalg.norm(coords[i] - coords[j])))
+        spreads[residue_key] = max_dist
+    return spreads
+
+
+def _validate_rotation_matrix(R: np.ndarray) -> tuple[float, float]:
+    ortho_error = float(np.linalg.norm(R.T @ R - np.eye(3)))
+    det = float(np.linalg.det(R))
+    return ortho_error, det
+
+
+def validate_transformed_pdb(
+    input_pdb: str,
+    output_pdb: str,
+    R: np.ndarray,
+    t: np.ndarray,
+    *,
+    chain_id: str | None = None,
+    atom_error_tolerance: float = 1e-2,
+    new_ca_spike_threshold: float = 20.0,
+) -> dict:
+    """
+    Validate that output_pdb is exactly the rigidly transformed version of input_pdb.
+    """
+    ortho_error, det = _validate_rotation_matrix(R)
+    if ortho_error > 1e-6:
+        raise RuntimeError(f"Rotation matrix is not orthonormal enough: ||R^T R - I||={ortho_error:.3e}")
+    if abs(det - 1.0) > 1e-6:
+        raise RuntimeError(f"Rotation matrix determinant is invalid: det(R)={det:.6f}")
+
+    input_atoms = _iter_atom_records(input_pdb)
+    output_atoms = _iter_atom_records(output_pdb)
+    if len(input_atoms) != len(output_atoms):
+        raise RuntimeError(
+            f"Atom count mismatch after transform: input={len(input_atoms)} output={len(output_atoms)}"
+        )
+
+    max_atom_error = 0.0
+    for idx, (in_atom, out_atom) in enumerate(zip(input_atoms, output_atoms), start=1):
+        if _atom_record_key(in_atom) != _atom_record_key(out_atom):
+            raise RuntimeError(
+                "Atom identity/order changed during writeout "
+                f"at record #{idx}: input={_atom_record_key(in_atom)} output={_atom_record_key(out_atom)}"
+            )
+
+        if chain_id is not None and in_atom.chain_id.strip() != chain_id:
+            expected = in_atom.coord
+        else:
+            expected = (R @ in_atom.coord) + t
+        max_atom_error = max(max_atom_error, float(np.linalg.norm(expected - out_atom.coord)))
+
+    if max_atom_error > atom_error_tolerance:
+        raise RuntimeError(
+            f"Output coordinates do not match rigid transform: max atom error={max_atom_error:.3f} A"
+        )
+
+    input_max_ca = max_consecutive_ca_distance(input_pdb)
+    output_max_ca = max_consecutive_ca_distance(output_pdb)
+    if input_max_ca <= new_ca_spike_threshold < output_max_ca:
+        raise RuntimeError(
+            "Transform introduced a new CA spike "
+            f"(input max={input_max_ca:.3f} A, output max={output_max_ca:.3f} A)"
+        )
+
+    input_spreads = _collect_residue_coord_spreads(input_pdb)
+    output_spreads = _collect_residue_coord_spreads(output_pdb)
+    max_internal_spread_increase = 0.0
+    worst_residue = None
+    for residue_key, input_spread in input_spreads.items():
+        output_spread = output_spreads.get(residue_key, input_spread)
+        increase = output_spread - input_spread
+        if increase > max_internal_spread_increase:
+            max_internal_spread_increase = increase
+            worst_residue = residue_key
+
+    if max_internal_spread_increase > 20.0:
+        raise RuntimeError(
+            "Transform introduced a residue with incompatible internal coordinates "
+            f"(worst residue={worst_residue}, spread increase={max_internal_spread_increase:.3f} A)"
+        )
+
+    return {
+        "rotation_orthogonality_error": ortho_error,
+        "rotation_det": det,
+        "max_atom_error": max_atom_error,
+        "input_max_consecutive_ca_distance": input_max_ca,
+        "output_max_consecutive_ca_distance": output_max_ca,
+        "max_internal_residue_spread_increase": max_internal_spread_increase,
+    }
+
+
 def apply_rigid_transform_to_pdb(
     input_pdb: str,
     output_pdb: str,
@@ -290,21 +466,35 @@ def apply_rigid_transform_to_pdb(
     """
     Apply (R, t) to ALL atoms in the PDB (optionally restricted to one chain) and write output_pdb.
     """
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("struct", input_pdb)
-    model, _ = _first_model_first_chain(structure, input_pdb)
-
-    chains: Iterable = model.get_chains() if chain_id is None else [model[chain_id]]
-    for chain in chains:
-        for residue in chain:
-            for atom in residue.get_atoms():
-                x = np.asarray(atom.coord, dtype=float)
-                atom.coord = (R @ x) + t
-
     os.makedirs(os.path.dirname(output_pdb), exist_ok=True)
-    io = PDBIO()
-    io.set_structure(structure)
-    io.save(output_pdb)
+    with open(input_pdb, "r") as src, open(output_pdb, "w") as dst:
+        for line in src:
+            record = line[:6].strip()
+            if record not in {"ATOM", "HETATM"}:
+                dst.write(line)
+                continue
+
+            if chain_id is not None and line[21].strip() != chain_id:
+                dst.write(line)
+                continue
+
+            x = np.asarray(
+                [
+                    float(line[30:38]),
+                    float(line[38:46]),
+                    float(line[46:54]),
+                ],
+                dtype=float,
+            )
+            new_coord = (R @ x) + t
+            new_line = (
+                f"{line[:30]}"
+                f"{_format_pdb_coord(float(new_coord[0]))}"
+                f"{_format_pdb_coord(float(new_coord[1]))}"
+                f"{_format_pdb_coord(float(new_coord[2]))}"
+                f"{line[54:]}"
+            )
+            dst.write(new_line)
 
 
 def rmsd(P: np.ndarray, Q: np.ndarray) -> float:
@@ -323,6 +513,7 @@ def align_full_pdb_via_flanks(
     flank: int = 40,
     mustang_exe: str = "mustang",
     mustang_target_chain_id: str = "B",
+    validate_output: bool = True,
 ) -> dict:
     """
     End-to-end for a single structure:
@@ -356,6 +547,9 @@ def align_full_pdb_via_flanks(
 
     full_aligned_pdb = os.path.join(work_dir, "full_aligned.pdb")
     apply_rigid_transform_to_pdb(target_full_pdb, full_aligned_pdb, R, t)
+    validation = None
+    if validate_output:
+        validation = validate_transformed_pdb(target_full_pdb, full_aligned_pdb, R, t)
 
     return {
         "template_seg_pdb": template_seg,
@@ -370,6 +564,7 @@ def align_full_pdb_via_flanks(
         "segment_rmsd_after_transform": seg_rmsd,
         "full_aligned_pdb": full_aligned_pdb,
         "produced_files": mres.get("produced_files", []),
+        "validation": validation,
     }
 
 
@@ -384,6 +579,7 @@ def batch_align_full_pdbs_via_flanks(
     mustang_exe: str = "mustang",
     mustang_target_chain_id: str = "B",
     glob_pattern: str = "*.pdb",
+    validate_output: bool = True,
 ) -> dict:
     """
     Batch process:
@@ -413,10 +609,14 @@ def batch_align_full_pdbs_via_flanks(
                 flank=flank,
                 mustang_exe=mustang_exe,
                 mustang_target_chain_id=mustang_target_chain_id,
+                validate_output=validate_output,
             )
             out_pdb = os.path.join(out_full_aligned_dir, f"{name}.pdb")
             # Move/copy produced full aligned pdb into the canonical output folder
             apply_rigid_transform_to_pdb(target_full_pdb, out_pdb, res["R"], res["t"])
+            validation = None
+            if validate_output:
+                validation = validate_transformed_pdb(target_full_pdb, out_pdb, res["R"], res["t"])
 
             transforms[name] = {
                 "name": name,
@@ -428,6 +628,7 @@ def batch_align_full_pdbs_via_flanks(
                 "segment_rmsd_after_transform": float(res["segment_rmsd_after_transform"]),
                 "mustang_rmsd": res.get("mustang_rmsd"),
                 "mustang_output_prefix": res["mustang_output_prefix"],
+                "validation": validation,
             }
         except Exception as e:
             failures.append({"name": name, "input_full_pdb": target_full_pdb, "reason": str(e)})
